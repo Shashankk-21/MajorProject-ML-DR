@@ -1,0 +1,43 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+
+# ===== IDEs =====
+.vscode/
+.idea/
+
+# ===== Data (raw datasets & generated cache -- never commit) =====
+data/cache/
+data/raw/
+# data/splits/ is intentionally NOT ignored -- manifest CSVs are tracked
+
+# ===== Model artifacts (large, regenerable -- relevant once training starts) =====
+models/saved_models/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.onnx
+
+# ===== Secrets / credentials =====
+# Worth having now that GPU access is in the picture, even if unused yet
+.env
+*.env
+credentials*
+*.pem
+*.key
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== Virtual environments =====
+venv/
+env/
+dr_project/
+
+# ===== OS generated files =====
+.DS_Store
+Thumbs.db

@@ -258,7 +258,7 @@ class RandomClahe(A.ImageOnlyTransform):
         self.tile_grid_size = tile_grid_size
 
     def get_params(self) -> Dict[str, Any]:
-        return {"clip_limit": random.uniform(*self.clip_limit_range)}
+        return {"clip_limit": self.py_random.uniform(*self.clip_limit_range)}
 
     def apply(self, img: Any, clip_limit: float = 2.0, **params: Any) -> Any:
         return apply_clahe(img, clip_limit=clip_limit, tile_grid_size=self.tile_grid_size)

@@ -117,6 +117,7 @@ resolved defensively where the finalized doc + EDA materials were silent)
 from __future__ import annotations
 
 import logging
+import random
 import re
 from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence, Tuple
@@ -126,7 +127,7 @@ import pandas as pd
 import torch
 from PIL import Image
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
 
 from .augmentation import get_eval_transforms, get_train_transforms
 
@@ -141,6 +142,9 @@ __all__ = [
     "apply_eyepacs_max_samples_cap",
     "split_manifest",
     "DRDataset",
+    "compute_class_weights",
+    "DEFAULT_CLASS_WEIGHT_CAP",
+    "make_augmentation_worker_init_fn",
     "get_dataloaders",
 ]
 
@@ -149,6 +153,8 @@ __all__ = [
 # ---------------------------------------------------------------------------
 VALID_SPLITS: Tuple[str, str, str] = ("train", "val", "test")
 NUM_DR_GRADES: int = 5  # 0=No DR .. 4=Proliferative DR
+# Absolute upper bound on any class loss weight (same for all 8 experiments).
+DEFAULT_CLASS_WEIGHT_CAP: float = 10.0
 
 # The FINAL manifest schema build_dataset.py (File 4) must produce and this
 # file's DRDataset/get_dataloaders consume. `cached_image_path` points at
@@ -985,6 +991,198 @@ class DRDataset(Dataset):
         return transformed, label
 
 
+def compute_class_weights(
+    train_labels: np.ndarray,
+    num_classes: int = NUM_DR_GRADES,
+    *,
+    cap: float = DEFAULT_CLASS_WEIGHT_CAP,
+) -> np.ndarray:
+    """Compute capped per-class loss weights from a client's own train-split labels.
+
+    SUPERSEDES the old WeightedRandomSampler-based imbalance handling
+    that used to live in get_dataloaders() (see that function's
+    docstring for why). Per training-phase-decisions.md, Section 2:
+    class imbalance is now handled via a class-weighted loss, identical
+    across all 8 experiments, computed by the CALLER (training code)
+    from this client's own train-split labels and applied in the loss
+    function -- never in the DataLoader.
+
+    Basis: w_c = N / (K * n_c), K = num_classes, which has expected weight
+    1 under the client's own label distribution p_c = n_c / N when every
+    class is present (keeps LR/max_grad_norm comparable to an unweighted
+    run). The weights are then limited to the ABSOLUTE value `cap`:
+
+    * Not cap-then-renormalize (that pushes capped classes, and sometimes
+      other classes, back above the cap). Instead one scale s is solved by
+      bisection so that sum_c p_c * min(s * w_c, cap) == 1 over the
+      PRESENT classes. s >= 1, the result has mean 1 (to ~1e-12) and
+      max <= cap, and rarer classes never get a smaller weight.
+    *Classes with zero samples (p_c = 0): weight = 0 (the existing contract), excluded from the mean (logged).
+    *No inf/NaN anywhere.
+    * If the cap never engages, s = K / K_present (exactly 1 when all
+      classes are present) and the output is the plain formula
+      N / (K_present * n_c) over the present classes, identical to the
+      uncapped version of this function.
+
+    Args:
+        train_labels: 1-D array-like of this client's train-split
+            integer DR grades (e.g. a DRDataset's filtered
+            `.data["label"]`, or `train_dataset.data["label"].to_numpy()`
+            from get_dataloaders()).
+        num_classes: Number of DR grade classes. Defaults to
+            NUM_DR_GRADES (5).
+        cap: Absolute maximum weight, finite and >= 1. Defaults to
+            DEFAULT_CLASS_WEIGHT_CAP (10.0). cap == 1 gives every PRESENT class weight 1 (absent classes stay 0).
+
+    Returns:
+        A float64 array of shape (num_classes,): per-class loss weight,
+        directly indexable by a label (weights[label]).
+
+    Raises:
+        DatasetError: if train_labels is not 1-D, is empty, is not
+            integer-valued, or contains a value outside
+            [0, num_classes); or if cap is not a finite number >= 1.
+    """
+    labels = np.asarray(train_labels)
+    if labels.ndim != 1:
+        raise DatasetError(f"compute_class_weights: train_labels must be 1-D, got shape {labels.shape}")
+    if labels.size == 0:
+        raise DatasetError("compute_class_weights: train_labels is empty")
+    if not np.issubdtype(labels.dtype, np.integer):
+        if not np.all(np.mod(labels, 1) == 0):
+            raise DatasetError(
+                f"compute_class_weights: train_labels must be integer-valued, got dtype {labels.dtype}"
+            )
+        labels = labels.astype(np.int64)
+    if labels.min() < 0 or labels.max() >= num_classes:
+        raise DatasetError(
+            f"compute_class_weights: train_labels must be in [0, {num_classes}), got range "
+            f"[{int(labels.min())}, {int(labels.max())}]"
+        )
+    if (
+        isinstance(cap, (bool, np.bool_))
+        or not isinstance(cap, (int, float, np.integer, np.floating))
+        or not np.isfinite(cap)
+        or cap < 1.0
+    ):
+        raise DatasetError(f"compute_class_weights: cap must be a finite number >= 1, got {cap!r}")
+    cap = float(cap)
+
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    n_total = float(labels.size)
+    present = counts > 0
+    k_present = int(present.sum())
+
+    zero_classes = np.where(~present)[0]
+    if zero_classes.size:
+           logger.warning(
+               "compute_class_weights: class(es) %s have zero training samples; their weight is set to 0 "
+               "and they are excluded from the mean.",
+               zero_classes.tolist(),
+           )
+
+    p = counts[present] / n_total
+    raw = n_total / (num_classes * counts[present])  # w_c = N / (K * n_c)
+    scale = num_classes / k_present  # uncapped mean == 1; exactly 1.0 when all classes are present
+
+    weights = np.zeros(num_classes, dtype=np.float64)
+    if scale * float(raw.max()) <= cap:
+        weights[present] = n_total / (k_present * counts[present])  # cap never engages
+        return weights
+
+    # Cap engages: f(s) = sum_c p_c * min(s * w_c, cap) is nondecreasing, f(scale) < 1 and
+    # f(cap / min w) = cap >= 1, so the root is bracketed.
+    lo, hi = scale, cap / float(raw.min())
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if float((p * np.minimum(mid * raw, cap)).sum()) < 1.0:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo <= 1e-15 * hi:
+            break
+    weights[present] = np.minimum(hi * raw, cap)
+    logger.info(
+        "compute_class_weights: cap %g engaged for class(es) %s (raw weights %s); scale s=%.6f",
+        cap, np.where(present)[0][(hi * raw) >= cap].tolist(),
+        [round(float(w), 4) for w in raw], hi,
+    )
+    return weights
+
+
+# ---------------------------------------------------------------------------
+# Augmentation seeding (TRAIN loader only)
+# ---------------------------------------------------------------------------
+def _seed_augmentation_transform(transform: Callable, seed: int) -> None:
+    """Re-seed every random draw inside an Albumentations Compose from one integer seed. In place.
+
+    Deliberately uses Compose.set_random_state() with ONE shared numpy
+    Generator and ONE shared python random.Random built from `seed`, NOT
+    Compose.set_random_seed(seed). The latter gives every child transform
+    its own generator seeded with the SAME value, so children that share a
+    probability (e.g. HorizontalFlip and VerticalFlip, both p=0.5) draw
+    identical sequences and fire in lockstep -- verified on
+    albumentations==2.0.8: in 400 calls a flip pair never flipped on only
+    one axis, versus roughly half the calls when unseeded. With shared
+    generators the children consume a single stream in sequence, so they
+    stay independent of one another while the whole pipeline remains
+    reproducible from `seed`.
+
+    Args:
+        transform: An albumentations Compose (anything exposing
+            set_random_state(numpy_generator, python_random)).
+        seed: Non-negative integer.
+    """
+    transform.set_random_state(np.random.default_rng(seed), random.Random(seed))
+
+
+def _augmentation_worker_init(worker_id: int) -> None:
+    """DataLoader worker_init_fn body; see make_augmentation_worker_init_fn().
+
+    Defined at module level (not as a closure) so it is picklable, which
+    DataLoader needs for multiprocessing start methods that spawn rather
+    than fork worker processes (e.g. Windows).
+    """
+    info = torch.utils.data.get_worker_info()
+    _seed_augmentation_transform(info.dataset.transform, int(info.seed) % 2**32)
+
+
+def make_augmentation_worker_init_fn() -> Callable[[int], None]:
+    """Return a DataLoader `worker_init_fn` that gives each worker its own augmentation RNG state.
+
+    Albumentations transforms own their numpy / python random generators
+    (entropy-seeded unless seeded, independent of torch/numpy/python global
+    seeds), and each DataLoader worker receives a COPY of the dataset and
+    therefore of those generators -- so without this hook workers duplicate
+    each other's augmentation sequence and every epoch replays it.
+
+    The returned function runs inside each worker as
+    worker_init(worker_id): it reads torch.utils.data.get_worker_info() and
+    reseeds `info.dataset.transform` from int(info.seed) % 2**32.
+    info.seed = base_seed + worker_id, where base_seed is drawn from the
+    loader's own generator each time an epoch's iterator is created, so the
+    seed is unique per worker and per epoch and reproducible from a seeded
+    generator.
+
+    Requirements (all hold for get_dataloaders()'s train loader):
+        - `info.dataset` is the DRDataset itself (no Subset or other
+          wrapper), exposing the transform as `.transform`.
+        - persistent_workers is False. With persistent workers,
+          worker_init would run once per worker rather than once per
+          epoch, and the "unique per epoch" property would be lost.
+        - The transform has set_random_state() (every Albumentations Compose does).
+
+    Opacus's DPDataLoader is expected to carry worker_init_fn over when it
+    rebuilds a DP loader, so no DP-specific code is added; this has not been
+    verified by this repository's tests.
+
+    Returns:
+        A picklable function worker_init(worker_id) suitable for
+        DataLoader(worker_init_fn=...).
+    """
+    return _augmentation_worker_init
+
+
 def get_dataloaders(
     client_name: str,
     *,
@@ -997,11 +1195,58 @@ def get_dataloaders(
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Build one client's independent train/val/test DataLoaders.
 
-    Part 1, Step 7: WeightedRandomSampler weight = 1/class_count, computed
-    from THIS client's own train-split label counts only -- never
-    globally, never from another client. num_samples = len(train
-    dataset). Applied to the train loader only; val/test loaders use a
-    fixed (non-shuffled) order.
+    SUPERSEDED for loader construction (training-phase-decisions.md,
+    Section 2): the original preprocessing requirement here was "Part 1,
+    Step 7: WeightedRandomSampler weight = 1/class_count, train only".
+    That is no longer what this function does -- validated against
+    Opacus 1.6.0 source, DPDataLoader.from_data_loader rebuilds a DP
+    training loader from its .dataset using Opacus's own uniform Poisson
+    sampling and discards whatever sampler the loader had, so a sampler
+    here would have been silently dropped in the 5 DP experiments (4-8)
+    while staying active in the 3 non-DP ones (1-3), making the 8
+    experiments non-comparable. Class imbalance is now handled by a
+    class-weighted loss instead, identical across all 8 experiments --
+    see compute_class_weights(), called by the training code on this
+    same client's train-split labels and applied in the loss function,
+    not here. Manifests, splits, the offline cache, and augmentation are
+    unaffected by this change.
+
+    Train loader now uses a plain shuffle (shuffle=True) with its own
+    seeded generator; val/test loaders are unchanged -- a fixed,
+    non-shuffled order.
+
+    AUGMENTATION SEEDING (train loader only): Albumentations transforms own
+    their random generators (entropy-seeded, independent of global seeds)
+    and every DataLoader worker gets a copy, so unseeded workers duplicate
+    each other's augmentation sequence and each epoch replays it. The train
+    loader is therefore built with
+    worker_init_fn=make_augmentation_worker_init_fn(), which reseeds the
+    transform inside each worker from torch's per-worker seed
+    (base_seed + worker_id; base_seed is drawn from the loader's seeded
+    generator for every epoch's iterator) -- unique per worker and per
+    epoch, reproducible from `seed`. Validation/test loaders, eval
+    transforms, the signature and the return value are unchanged. This
+    relies on persistent_workers staying False (this function never sets
+    it): with persistent workers worker_init would run once per worker,
+    not once per epoch.
+
+    With num_workers == 0 no worker_init_fn is ever invoked, so the train
+    transform is instead seeded once, here, from `seed`. In that mode the
+    transform's generator state is not part of any checkpoint, so exact
+    augmentation resume holds only with num_workers > 0.
+
+    SIDE EFFECT: `train_transform` (the caller's object, or the default one
+    built here) has its random state replaced in place when num_workers == 0.
+    Callers that share one transform object across clients or rounds should
+    pass a per-client / per-round `seed` (or separate transform objects) so
+    those streams do not coincide.
+
+    DP NOTE: if this loader will be wrapped by Opacus for a DP experiment
+    (4-8), `batch_size` MUST be set to that experiment's configured
+    dp_logical_batch_size (locked at 64), not this function's default of
+    32 -- Opacus derives sample_rate = 1/len(loader) from however many
+    batches this loader actually produces, so the wrong batch_size here
+    silently miscalibrates that client's privacy accounting.
 
     Args:
         client_name: One of "APTOS", "IDRiD", "Messidor-2", "EyePACS"
@@ -1009,19 +1254,27 @@ def get_dataloaders(
             not this argument, determines which images are loaded).
         manifest_path: Path to this client's FINAL manifest CSV (written
             by build_dataset.py), with columns FINAL_MANIFEST_COLUMNS.
-        batch_size: Batch size for all 3 loaders.
-        num_workers: DataLoader worker count for all 3 loaders.
+        batch_size: Batch size for all 3 loaders. See DP NOTE above if
+            building a DP experiment's loader.
+        num_workers: DataLoader worker count for all 3 loaders. See
+            AUGMENTATION SEEDING above for what 0 vs > 0 means for the
+            train transform.
         train_transform: Defaults to augmentation.get_train_transforms().
+            Must expose set_random_state() (every albumentations Compose
+            does); a plain callable is rejected with DatasetError.
         eval_transform: Defaults to augmentation.get_eval_transforms(),
             used for both val and test.
-        seed: Seed for the WeightedRandomSampler's generator.
+        seed: Seeds the train loader's shuffle generator and, when
+            num_workers == 0, the train transform's random state (as
+            int(seed) % 2**32).
 
     Returns:
         (train_loader, val_loader, test_loader).
 
     Raises:
         DatasetError: if the manifest file is missing, missing required
-            columns, or any split has zero rows.
+            columns, any split has zero rows, or train_transform has no
+            set_random_state() method.
     """
     manifest_path = Path(manifest_path)
     if not manifest_path.exists():
@@ -1037,35 +1290,30 @@ def get_dataloaders(
     if eval_transform is None:
         eval_transform = get_eval_transforms()
 
+    if not callable(getattr(train_transform, "set_random_state", None)):
+        raise DatasetError(
+            f"{client_name}: train_transform ({type(train_transform).__name__}) has no "
+            f"set_random_state() method; it must be an albumentations Compose (or expose the "
+            f"same method) so the augmentation RNG can be seeded per DataLoader worker."
+        )
+
     train_dataset = DRDataset(manifest_df, split="train", transform=train_transform)
     val_dataset = DRDataset(manifest_df, split="val", transform=eval_transform)
     test_dataset = DRDataset(manifest_df, split="test", transform=eval_transform)
 
-    train_labels = train_dataset.data["label"].to_numpy()
-    class_counts = np.bincount(train_labels, minlength=NUM_DR_GRADES)
-    zero_classes = np.where(class_counts == 0)[0]
-    if zero_classes.size:
-        logger.warning(
-            "%s: train split has zero samples for class(es) %s; those classes get no "
-            "sampling weight (there are no such samples to weight).",
-            client_name,
-            zero_classes.tolist(),
-        )
-    class_weights = np.zeros(NUM_DR_GRADES, dtype=np.float64)
-    nonzero = class_counts > 0
-    class_weights[nonzero] = 1.0 / class_counts[nonzero]
-    sample_weights = class_weights[train_labels]
-
     generator = torch.Generator().manual_seed(seed)
-    sampler = WeightedRandomSampler(
-        weights=torch.as_tensor(sample_weights, dtype=torch.double),
-        num_samples=len(train_dataset),
-        replacement=True,
-        generator=generator,
-    )
-
+    if num_workers == 0:
+        # worker_init_fn is not invoked without worker processes, so seed the
+        # transform once here instead (see AUGMENTATION SEEDING in the docstring).
+        _seed_augmentation_transform(train_transform, int(seed) % 2**32)
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, drop_last=False
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=False,
+        generator=generator,
+        worker_init_fn=make_augmentation_worker_init_fn(),
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False

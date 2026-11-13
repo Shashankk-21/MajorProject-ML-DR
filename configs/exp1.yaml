@@ -1,0 +1,2 @@
+# Experiment 1: centralized baseline, non-DP, pooled data (train_centralized).
+algorithm: centralized

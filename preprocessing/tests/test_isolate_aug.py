@@ -1,10 +1,13 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
+from copy import deepcopy
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
 import albumentations as A
+from PIL import Image
+
 from preprocessing.image_processing import run_offline_pipeline
-from preprocessing.augmentation import RandomClahe
+from preprocessing.augmentation import RandomClahe, get_train_transforms
 
 def run_isolation_test():
     raw_path = Path(r"C:\MajorProject - Datasets\APTOS-2019-Kaggle\train_images\train_images\1b8ad0afe9fb.png")
@@ -19,8 +22,16 @@ def run_isolation_test():
     # Force custom CLAHE to its absolute maximum clip limit
     test_clahe = A.Compose([RandomClahe(clip_limit_range=(4.0, 4.0), p=1.0)])
     
-    # Force GaussNoise (using the legacy var_limit matching older albumentations)
-    test_noise = A.Compose([A.GaussNoise(var_limit=(10.0, 50.0), p=1.0)])
+    # Reuse the production GaussNoise configuration, but always apply it for
+    # this isolated visual check.
+    production_noise = next(
+        transform
+        for transform in get_train_transforms().transforms
+        if transform.__class__.__name__ == "GaussNoise"
+    )
+    test_noise_transform = deepcopy(production_noise)
+    test_noise_transform.p = 1.0
+    test_noise = A.Compose([test_noise_transform])
     
     fig, axes = plt.subplots(2, 5, figsize=(15, 6))
     

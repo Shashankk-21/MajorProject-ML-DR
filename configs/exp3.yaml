@@ -1,0 +1,3 @@
+# Experiment 3: FedProx, non-DP.
+algorithm: fedprox
+proximal-mu: 0.01

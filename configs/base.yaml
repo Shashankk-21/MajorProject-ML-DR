@@ -1,0 +1,49 @@
+# Identical across all 8 experiments. null = not decided yet: the loader refuses to render.
+# manifest-root and checkpoint-root are pod inputs (env or CLI), never set here.
+# YAML note: write floats in decimal form (0.0001); PyYAML reads 1e-4 as a string.
+
+# Step-zero results (decisions doc, Open items): fill after the diagnostics, then re-validate.
+lora-rank: null            # sweep {4,8,16,32}, alpha = 2 x rank; lower rank wins near-ties (Section 1)
+lora-alpha: null
+max-grad-norm: null        # per-sample-norm diagnostic; hypothesis 1.0 (Section 4)
+
+# Run and data (Section 2)
+run-seed: 42
+img-size: 224
+num-classes: 5
+pretrained: true
+num-workers: 8             # pod-tunable, must stay > 0
+physical-batch-size: 32    # verify on the pod (16 GiB slice)
+accumulation-steps: 2
+effective-batch-size: 64   # also the DP logical batch
+label-smoothing: 0.1
+weight-decay: 0.01
+lr-lora-peak: 0.0001
+lr-head-peak: 0.001
+
+# Federated schedule (Sections 2 and 5): 10 rounds, 3 local epochs, round 1 = 0.5 x peak,
+# peak at round 2, cosine to 10 percent of peak at the last round
+num-rounds: 10
+local-epochs: 3
+warmup-rounds: 1
+warmup-start-factor: 0.5
+lr-min-factor: 0.1
+timeout: 604800.0          # strategy.start default is 3600 s, shorter than the pod restart cycle
+epsilon-tolerance: 0.01    # calibration solver tolerance (server default)
+
+# Differential privacy (Section 4); used only when an experiment sets dp: true
+dp: false
+accountant: rdp
+delta: 0.00001
+grad-sample-mode: functorch
+dp-logical-batch-size: 64
+
+# Tracking
+wandb-cm-every: 5
+diagnostic: false
+
+# Experiment 1 only (centralized: <=20 epochs, patience 5; 5 percent warmup = 1 of 20 epochs)
+centralized-max-epochs: 20
+centralized-patience: 5
+centralized-warmup-epochs: 1.0
+centralized-warmup-start-factor: 0.001

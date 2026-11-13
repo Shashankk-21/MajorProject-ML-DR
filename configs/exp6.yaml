@@ -1,0 +1,5 @@
+# Experiment 6: FedProx + DP, target epsilon 5.
+algorithm: fedprox
+dp: true
+target-epsilon: 5
+proximal-mu: 0.01

@@ -41,3 +41,14 @@ dr_project/
 # ===== OS generated files =====
 .DS_Store
 Thumbs.db
+*.tar
+
+# ===== Weights & Biases =====
+wandb/
+.wandb/
+.wandb_api_key
+**/.wandb_api_key
+
+# ===== Local environment variants =====
+.env.*
+!.env.example

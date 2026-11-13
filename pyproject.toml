@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "federated-dr-detection"
+version = "0.1.0"
+description = "Federated DP-LoRA CoAtNet-1 for diabetic retinopathy detection"
+# Only flwr: flwr installs listed dependencies at run time and could replace the pod's torch.
+dependencies = ["flwr==1.37.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.flwr.app]
+publisher = "dr-project"
+# flwr run zips the project (py/toml/md/yaml/yml/json/jsonl, 10 MB cap) and runs the INSTALLED copy.
+fab-exclude = ["training-smoketests/**", "notebooks/**"]
+
+[tool.flwr.app.components]
+serverapp = "federated.server:app"
+clientapp = "federated.client:app"
+
+# Every key the server reads, so `--run-config` can override it. The placeholders are
+# deliberately invalid (0, "", 0.0): a bare `flwr run .` fails validate_server_config.
+# Real values come from configs/loader.py (it writes the --run-config TOML).
+[tool.flwr.app.config]
+experiment-id = ""
+algorithm = ""
+dp = false
+run-seed = 0
+num-rounds = 0
+local-epochs = 0
+lora-rank = 0
+lora-alpha = 0
+img-size = 0
+num-classes = 0
+pretrained = true
+physical-batch-size = 0
+accumulation-steps = 0
+effective-batch-size = 0
+label-smoothing = 0.0
+weight-decay = 0.0
+num-workers = 0
+manifest-root = ""
+checkpoint-root = ""
+lr-lora-peak = 0.0
+lr-head-peak = 0.0
+warmup-rounds = 1
+warmup-start-factor = 0.5
+lr-min-factor = 0.1
+timeout = 604800.0
+epsilon-tolerance = 0.01
+# fedavg ignores proximal-mu = 0.0; fedprox needs it > 0 (see the report: server accepts 0.0 under fedavg).
+proximal-mu = 0.0
+calibration-path = ""
+accountant = ""
+target-epsilon = 0.0
+delta = 0.0
+max-grad-norm = 0.0
+grad-sample-mode = ""
+dp-logical-batch-size = 0
+run-hook = ""
+wandb-cm-every = 5
+diagnostic = false

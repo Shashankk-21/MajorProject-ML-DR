@@ -52,3 +52,7 @@ wandb/
 # ===== Local environment variants =====
 .env.*
 !.env.example
+
+# ===== Typings /tomllib =====
+typings/
+tomllib/

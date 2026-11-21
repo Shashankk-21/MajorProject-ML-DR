@@ -148,7 +148,7 @@ except Exception as exc:
 
 # 5. Ray
 try:
-    import ray
+    import ray # type: ignore
 
     ray_started = False
     try:
@@ -316,7 +316,7 @@ try:
         ["git", "-C", str(REPO_ROOT), "fetch", "--quiet", "origin", "main"],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=300,
         check=False,
     )
     if fetch.returncode != 0:

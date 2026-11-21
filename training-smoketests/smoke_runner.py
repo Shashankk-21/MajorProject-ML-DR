@@ -311,7 +311,7 @@ def _():
 
     with Harness(spurious) as h:
         rc, out, err = capture(rq.main, argv_for([2], ck, cfg, "--dry-run", "--max-attempts", "3"))
-    assert rc == 0 and len(h.flwr_calls()) == 2
+    assert rc == 0 and len(h.flwr_calls()) == 1 and "done" in out
 
 
 @test("Q6 blocked experiments (null step-zero values) are skipped with the loader's reason: exit 4; a failure takes precedence (exit 3)")

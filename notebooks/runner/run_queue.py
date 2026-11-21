@@ -72,6 +72,8 @@ _CHILD_LOCK = threading.Lock()
 _CHILD: Optional["subprocess.Popen[str]"] = None
 _FL_ATTEMPT = False
 _FL_INTERRUPTED = False
+_FL_RUN_ID: Optional[str] = None  # run id announced by THIS queue's own streaming CLI
+_RUN_STARTED_RE = re.compile(r"Successfully started run\s+(\d+)")
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +340,58 @@ def _stop_child(child: "subprocess.Popen[str]", signum: int) -> None:
     timer.start()
 
 
+def _stop_own_flwr_run() -> bool:
+    """Stop ONLY the Flower run that this queue started, and prove it is no longer active.
+
+    The run is identified by the id the queue's own streaming CLI announced. If that id was not
+    seen yet, the only active run is taken as ours (the launch guard proved there were none
+    before this attempt); several active runs, or a failing `flwr ls`, are ambiguous and nothing
+    is guessed. Other runs are never stopped.
+
+    Returns True when the streaming CLI may be terminated (our run is verified inactive, or no
+    run is active at all) and False when it must be left running: terminating the CLI while its
+    run is still active would orphan that run on the GPU."""
+    run_id = _FL_RUN_ID
+    if run_id is None:
+        try:
+            active = flwr_ls()
+        except GuardError as exc:
+            print(f"interrupt: could not list Flower runs: {exc}; leaving the streaming CLI running", file=sys.stderr)
+            return False
+        if not active:
+            return True
+        if len(active) > 1 or not active[0].get("run_id"):
+            print(
+                "interrupt: cannot tell which active Flower run belongs to this queue, so none is stopped "
+                "and the streaming CLI is left running: "
+                + "; ".join(active_run_description(run) for run in active),
+                file=sys.stderr,
+            )
+            return False
+        run_id = str(active[0]["run_id"])
+
+    stopped = False
+    deadline = time.monotonic() + INTERRUPT_STOP_CAP_SECONDS
+    while True:
+        try:
+            still_active = any(str(run.get("run_id")) == run_id for run in flwr_ls())
+        except GuardError as exc:
+            print(f"interrupt: could not verify Flower run {run_id} stopped: {exc}", file=sys.stderr)
+            still_active = True  # fail closed: unverified is not stopped
+        if not still_active:
+            return True
+        if not stopped:
+            stopped = stop_flwr_run(run_id)  # re-issued on the next pass if it failed
+        if time.monotonic() >= deadline:
+            print(
+                f"interrupt: Flower run {run_id} is still active after {INTERRUPT_STOP_CAP_SECONDS:g}s; "
+                f"leaving the streaming CLI running. Stop it with: flwr stop {run_id}",
+                file=sys.stderr,
+            )
+            return False
+        time.sleep(INTERRUPT_STOP_POLL_SECONDS)
+
+
 def _on_signal(signum: int, _frame: Any) -> None:
     _STOP.set()
     with _CHILD_LOCK:
@@ -345,32 +399,8 @@ def _on_signal(signum: int, _frame: Any) -> None:
     if _FL_ATTEMPT:
         global _FL_INTERRUPTED
         _FL_INTERRUPTED = True
-        try:
-            active = flwr_ls()
-        except GuardError as exc:
-            print(f"interrupt: could not list Flower runs: {exc}", file=sys.stderr)
-            active = []
-        for run in active:
-            run_id = run.get("run_id")
-            if run_id:
-                stop_flwr_run(str(run_id))
-            else:
-                print(
-                    "interrupt: active Flower run has no recognized run id: "
-                    + active_run_description(run),
-                    file=sys.stderr,
-                )
-
-        deadline = time.monotonic() + INTERRUPT_STOP_CAP_SECONDS
-        while time.monotonic() < deadline:
-            try:
-                if not flwr_ls():
-                    break
-            except GuardError as exc:
-                print(f"interrupt: could not verify Flower runs stopped: {exc}", file=sys.stderr)
-            time.sleep(ACTIVE_WAIT_POLL_SECONDS)
-
-        if child is not None:
+        safe_to_terminate = _stop_own_flwr_run()
+        if safe_to_terminate and child is not None:
             if child.poll() is None:
                 try:
                     child.terminate()
@@ -388,7 +418,7 @@ def run_cmd(argv: Sequence[str], log_path: Any, env: Optional[Mapping[str, str]]
     """Run argv from the repo root, tee stdout and stderr (merged) to log_path and the console,
     return the exit code (127 if the program cannot be started). The ONLY function here that
     starts a process, so tests can replace it."""
-    global _CHILD
+    global _CHILD, _FL_RUN_ID
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a", encoding="utf-8", errors="replace") as log:
@@ -412,6 +442,10 @@ def run_cmd(argv: Sequence[str], log_path: Any, env: Optional[Mapping[str, str]]
                 sys.stdout.flush()
                 log.write(line)
                 log.flush()
+                if _FL_ATTEMPT and _FL_RUN_ID is None:
+                    started = _RUN_STARTED_RE.search(line)
+                    if started:
+                        _FL_RUN_ID = started.group(1)
             return proc.wait()
         finally:
             with _CHILD_LOCK:
@@ -523,7 +557,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--checkpoint-root", default=os.environ.get("DR_CHECKPOINT_ROOT"))
     p.add_argument("--client-cpus", type=_positive_int, default=None, help="Ray CPUs per client (or DR_CLIENT_CPUS); FL runs")
     p.add_argument("--experiments", type=int, nargs="+", choices=range(1, 9), metavar="N", default=list(range(1, 9)))
-    p.add_argument("--dry-run", action="store_true", help="isolated -dryrun ids: FL 2 rounds, Experiment 1 2 epochs")
+    p.add_argument("--dry-run", action="store_true", help="isolated -dryrun ids: FL 2 rounds, Experiment 1 2 epochs (still real GPU training; CUDA is required)")
     p.add_argument("--max-attempts", type=_positive_int, default=5)
     p.add_argument("--sleep-between", type=float, default=60.0, help="seconds between attempts")
     p.add_argument("--restart-superlink", action="store_true", help="pkill -f flower-superlink once before the first FL attempt")
@@ -567,8 +601,8 @@ def preflight(args: argparse.Namespace, env: Mapping[str, str]) -> List[str]:
             problems.append("client-cpus must be 16 for the enforced one-GPU, four-client Flower simulation")
     if problems:
         return problems
-    if not args.dry_run and not cuda_available():
-        problems.append("no CUDA GPU is available to this process (a real run needs one; dry runs skip this check)")
+    if not cuda_available():
+        problems.append("no CUDA GPU is available to this process (every training run, including --dry-run, needs one)")
     if not LOCK_SCRIPT.is_file():
         problems.append(
             f"{LOCK_SCRIPT} does not exist, so the locked files cannot be verified"
@@ -644,7 +678,7 @@ def num_rounds_of(n: int, args: argparse.Namespace) -> Optional[int]:
 
 def attempt(n: int, k: int, args: argparse.Namespace, env: Mapping[str, str], session: Dict[str, bool]) -> bool:
     """One attempt of experiment n (the same command every time). True when it finished."""
-    global _FL_ATTEMPT, _FL_INTERRUPTED
+    global _FL_ATTEMPT, _FL_INTERRUPTED, _FL_RUN_ID
     eid = experiment_id(n, args.dry_run)
     log = _logs_dir(args) / f"{eid}-attempt{k}-{_utc_stamp()}.log"
     if n == 1:
@@ -673,6 +707,7 @@ def attempt(n: int, k: int, args: argparse.Namespace, env: Mapping[str, str], se
             print(f"WARNING: pkill -f flower-superlink exited {code}", file=sys.stderr)
     _FL_ATTEMPT = True
     _FL_INTERRUPTED = False
+    _FL_RUN_ID = None
     try:
         code = run_cmd(build_flwr_command(toml_path), log, env)
     finally:
@@ -739,11 +774,12 @@ def run_queue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     session_start = time.monotonic()
     refused = False
     for n in plan:
-        if interrupted or (failed and not args.continue_on_failure):
+        if interrupted or refused or (failed and not args.continue_on_failure):
             break
         eid = experiment_id(n, args.dry_run)
         print(f"\n=== {eid} ({states[n]['state']}: {states[n]['detail']}) ===", flush=True)
         finished = False
+        outcome: Optional[str] = None  # a specific result (refusal, wait timeout) the summary must keep
         for k in range(1, args.max_attempts + 1):
             if _STOP.is_set():
                 interrupted = True
@@ -756,7 +792,8 @@ def run_queue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
                 print(str(exc), file=sys.stderr)
                 if k == 1:
                     refused = True
-                    results[n]["result"] = "refused (active run or guard failure)"
+                    outcome = "refused (active run or guard failure)"
+                    results[n]["result"] = outcome
                     print(
                         "Active-run guard refuses launch before the first attempt "
                         "(exit 2).",
@@ -775,7 +812,8 @@ def run_queue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             if k < args.max_attempts:
                 if n >= 2:
                     if not wait_for_no_active_runs(args.active_wait_minutes):
-                        results[n]["result"] = "FAILED (active Flower run wait timed out)"
+                        outcome = "FAILED (active Flower run wait timed out)"
+                        results[n]["result"] = outcome
                         failed = True
                         print(
                             f"{eid}: active Flower run wait timed out; not stopped",
@@ -802,7 +840,7 @@ def run_queue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             break
         if finished:
             results[n]["result"] = "done"
-        else:
+        elif outcome is None:  # a refusal or wait timeout already recorded its own result; keep it
             results[n]["result"] = "FAILED"
             failed = True
             print(f"{eid}: FAILED after {args.max_attempts} attempts", file=sys.stderr)

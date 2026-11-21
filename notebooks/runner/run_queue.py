@@ -3,7 +3,8 @@ notebooks/runner/run_queue.py: run the eight experiments in order, with automati
 
     python notebooks/runner/run_queue.py --manifest-root P --checkpoint-root P --client-cpus N
         [--experiments 1 2 3 ...] [--dry-run] [--max-attempts 5] [--sleep-between 60]
-        [--restart-superlink] [--continue-on-failure] [--skip-lock-check] [--status] [--config-dir D]
+        [--restart-superlink] [--continue-on-failure] [--active-wait-minutes 120]
+        [--status] [--config-dir D]
 
 DR_MANIFEST_ROOT, DR_CHECKPOINT_ROOT and DR_CLIENT_CPUS work in place of the flags
 (--client-cpus is only needed when an FL experiment, 2-8, is in the queue).
@@ -27,16 +28,26 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
@@ -49,6 +60,9 @@ EXIT_OK, EXIT_REFUSED, EXIT_FAILED, EXIT_BLOCKED, EXIT_INTERRUPTED = 0, 2, 3, 4,
 DRY_RUN_ROUNDS = 2
 DRY_RUN_EPOCHS = 2
 GRACE_SECONDS = 10.0
+ACTIVE_WAIT_POLL_SECONDS = 30.0
+INTERRUPT_STOP_POLL_SECONDS = 30.0
+INTERRUPT_STOP_CAP_SECONDS = 300.0
 LOCK_SCRIPT = REPO_ROOT / "tools" / "verify_locks.py"
 EXP1_DRIVER = HERE / "run_experiment1.py"
 _ROUND_RE = re.compile(r"^round_(\d+)\.pt$")
@@ -56,6 +70,8 @@ _ROUND_RE = re.compile(r"^round_(\d+)\.pt$")
 _STOP = threading.Event()  # set by SIGINT / SIGTERM
 _CHILD_LOCK = threading.Lock()
 _CHILD: Optional["subprocess.Popen[str]"] = None
+_FL_ATTEMPT = False
+_FL_INTERRUPTED = False
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +150,171 @@ def format_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
     return "\n".join(lines)
 
 
+class GuardError(RuntimeError):
+    """Raised when a Flower or runner safety guard cannot prove it is safe."""
+
+
+class RunnerLockHeld(RuntimeError):
+    """Raised when the queue lock belongs to another live runner."""
+
+    def __init__(self, owner: str):
+        super().__init__(f"another runner owns the queue lock\n{owner}")
+        self.owner = owner
+
+
+def parse_flwr_ls(text: str) -> List[Dict[str, Any]]:
+    """Pure parser for the actual `flwr ls --format json` response."""
+    if not isinstance(text, str) or not text.strip():
+        raise GuardError("flwr ls returned empty output")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise GuardError(f"flwr ls returned malformed JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise GuardError("flwr ls JSON must be a dict")
+    if payload.get("success") is not True:
+        raise GuardError("flwr ls response has success=false or no success=true")
+    if "runs" not in payload or not isinstance(payload["runs"], list):
+        raise GuardError("flwr ls response has no valid runs list")
+
+    active: List[Dict[str, Any]] = []
+    for index, run in enumerate(payload["runs"]):
+        if not isinstance(run, dict):
+            raise GuardError(f"flwr ls runs[{index}] is not a dict")
+        status = run.get("status")
+        if not isinstance(status, str) or not status.strip():
+            raise GuardError(f"flwr ls runs[{index}] has no string status")
+        normalized = status.strip().lower()
+        if normalized.startswith(("pending", "starting", "running")):
+            run_id = None
+            for key in ("run-id", "run_id", "id"):
+                if key in run:
+                    value = run[key]
+                    if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).strip().isdigit():
+                        raise GuardError(f"flwr ls runs[{index}] has invalid {key}")
+                    run_id = str(value).strip()
+                    break
+            active.append({
+                "run_id": run_id,
+                "raw": run,
+                "status": normalized,
+            })
+        elif normalized.startswith("finished"):
+            continue
+        else:
+            raise GuardError(
+                f"flwr ls runs[{index}] has unknown status {status!r}"
+            )
+    return active
+
+
+def active_run_description(run: Mapping[str, Any]) -> str:
+    run_id = run.get("run_id")
+    if run_id:
+        return str(run_id)
+    return json.dumps(run.get("raw"), sort_keys=True, ensure_ascii=False)
+
+
+def flwr_ls(timeout: int = 60) -> List[Dict[str, Any]]:
+    """Run the real Flower status command; never silently treat failure as empty."""
+    try:
+        result = subprocess.run(
+            ["flwr", "ls", "--format", "json"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GuardError(f"flwr ls timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise GuardError(f"could not execute flwr ls: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise GuardError(
+            f"flwr ls exited {result.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    return parse_flwr_ls(result.stdout)
+
+
+def stop_flwr_run(run_id: str, timeout: int = 60) -> bool:
+    try:
+        result = subprocess.run(
+            ["flwr", "stop", run_id],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            print(
+                f"failed to stop Flower run {run_id}: "
+                + (f"exit {result.returncode}: {detail}" if detail else f"exit {result.returncode}"),
+                file=sys.stderr,
+            )
+            return False
+        return True
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"failed to stop Flower run {run_id}: {exc}", file=sys.stderr)
+        return False
+
+
+def acquire_runner_lock(checkpoint_root: Any, argv: Sequence[str]) -> Any:
+    """Acquire an OS exclusive lock; replaceable for smoke tests."""
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RunnerLockHeld(
+            "fcntl is unavailable on this platform; queue execution is refused"
+        ) from exc
+
+    control = Path(checkpoint_root) / "_runner.lock"
+    control.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        handle = control.open("a+", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            owner = control.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            owner = "(owner details unavailable)"
+        raise RunnerLockHeld(owner or "(owner details unavailable)")
+    except OSError as exc:
+        raise RunnerLockHeld(f"could not acquire queue lock: {exc}") from exc
+
+    handle.seek(0)
+    handle.truncate()
+    handle.write(
+        json.dumps({
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "argv": list(argv),
+        }, sort_keys=True)
+        + "\n"
+    )
+    handle.flush()
+    return handle
+
+
+def release_runner_lock(handle: Any) -> None:
+    if handle is None:
+        return
+    try:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # The one place that spawns processes
 # ---------------------------------------------------------------------------
@@ -161,6 +342,44 @@ def _on_signal(signum: int, _frame: Any) -> None:
     _STOP.set()
     with _CHILD_LOCK:
         child = _CHILD
+    if _FL_ATTEMPT:
+        global _FL_INTERRUPTED
+        _FL_INTERRUPTED = True
+        try:
+            active = flwr_ls()
+        except GuardError as exc:
+            print(f"interrupt: could not list Flower runs: {exc}", file=sys.stderr)
+            active = []
+        for run in active:
+            run_id = run.get("run_id")
+            if run_id:
+                stop_flwr_run(str(run_id))
+            else:
+                print(
+                    "interrupt: active Flower run has no recognized run id: "
+                    + active_run_description(run),
+                    file=sys.stderr,
+                )
+
+        deadline = time.monotonic() + INTERRUPT_STOP_CAP_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if not flwr_ls():
+                    break
+            except GuardError as exc:
+                print(f"interrupt: could not verify Flower runs stopped: {exc}", file=sys.stderr)
+            time.sleep(ACTIVE_WAIT_POLL_SECONDS)
+
+        if child is not None:
+            if child.poll() is None:
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+                timer = threading.Timer(GRACE_SECONDS, lambda: child.poll() is None and child.kill())
+                timer.daemon = True
+                timer.start()
+        return
     if child is not None:
         _stop_child(child, signum)
 
@@ -214,6 +433,76 @@ def cuda_available() -> bool:
         return False
 
 
+def validate_flower_config(path: Any) -> List[str]:
+    """Require the effective local simulation configuration for one-GPU, four-client runs."""
+    cfg_path = Path(path)
+    if not cfg_path.is_file():
+        return [f"{cfg_path} does not exist"]
+    try:
+        text = cfg_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"could not read {cfg_path}: {exc}"]
+    if tomllib is None:
+        return ["Python TOML support is unavailable"]
+    try:
+        cfg = tomllib.loads(text)
+    except Exception as exc:
+        return [f"{cfg_path} is not valid TOML: {exc}"]
+
+    problems: List[str] = []
+    try:
+        local_options = cfg["superlink"]["local"]["options"]
+    except (KeyError, TypeError):
+        local_options = {}
+    supernodes = local_options.get("num-supernodes")
+    if not isinstance(supernodes, int) or isinstance(supernodes, bool) or supernodes != 4:
+        problems.append("num-supernodes = 4 is required")
+
+    try:
+        backend = local_options["backend"]
+        resources = backend["client-resources"]
+        init_args = backend["init-args"]
+    except (KeyError, TypeError):
+        problems.append(
+            "superlink.local.options.backend.client-resources and "
+            "superlink.local.options.backend.init-args are required"
+        )
+        return problems
+
+    num_cpus = resources.get("num-cpus")
+    if not isinstance(num_cpus, int) or isinstance(num_cpus, bool) or num_cpus != 16:
+        problems.append("backend.client-resources.num-cpus = 16 is required")
+    num_gpus = resources.get("num-gpus")
+    if not isinstance(num_gpus, float) or num_gpus != 1.0:
+        problems.append("backend.client-resources.num-gpus = 1.0 is required")
+    init_gpus = init_args.get("num-gpus")
+    if not isinstance(init_gpus, int) or isinstance(init_gpus, bool) or init_gpus != 1:
+        problems.append("backend.init-args.num-gpus = 1 is required")
+    return problems
+
+
+def wait_for_no_active_runs(minutes: float) -> bool:
+    """Poll for active Flower runs after our stream process exits."""
+    deadline = time.monotonic() + max(0.0, float(minutes) * 60.0)
+    while True:
+        try:
+            active = flwr_ls()
+        except GuardError as exc:
+            print(f"Flower active-run guard failed while retrying: {exc}", file=sys.stderr)
+            return False
+        if not active:
+            return True
+        if time.monotonic() >= deadline:
+            for run in active:
+                print(
+                    "still active: "
+                    + active_run_description(run),
+                    file=sys.stderr,
+                )
+            return False
+        time.sleep(ACTIVE_WAIT_POLL_SECONDS)
+
+
 # ---------------------------------------------------------------------------
 # Arguments and preflight
 # ---------------------------------------------------------------------------
@@ -239,12 +528,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--sleep-between", type=float, default=60.0, help="seconds between attempts")
     p.add_argument("--restart-superlink", action="store_true", help="pkill -f flower-superlink once before the first FL attempt")
     p.add_argument("--continue-on-failure", action="store_true")
-    p.add_argument("--skip-lock-check", action="store_true")
+    p.add_argument("--active-wait-minutes", type=float, default=120.0,
+                   help="maximum retry wait for active Flower runs to become inactive")
     p.add_argument("--status", action="store_true", help="print the state of all eight experiments and exit")
     p.add_argument("--config-dir", default=None, help="alternative configs folder (testing)")
     args = p.parse_args(argv)
     if args.sleep_between < 0:
         p.error("--sleep-between must be >= 0")
+    if args.active_wait_minutes < 0:
+        p.error("--active-wait-minutes must be >= 0")
     if args.client_cpus is None:
         raw = os.environ.get("DR_CLIENT_CPUS", "").strip()
         if raw:
@@ -261,41 +553,39 @@ def _logs_dir(args: argparse.Namespace) -> Path:
 
 
 def preflight(args: argparse.Namespace, env: Mapping[str, str]) -> List[str]:
-    """Reasons to refuse (empty list = go). Warnings are printed here."""
+    """Reasons to refuse (empty list = go)."""
     problems: List[str] = []
     fl = [n for n in args.experiments if n >= 2]
     if not args.manifest_root:
         problems.append("missing --manifest-root (or DR_MANIFEST_ROOT)")
     if not args.checkpoint_root:
         problems.append("missing --checkpoint-root (or DR_CHECKPOINT_ROOT)")
-    if fl and not args.client_cpus:
-        problems.append("missing --client-cpus (or DR_CLIENT_CPUS); FL experiments need the Ray client CPU count")
+    if fl:
+        if not args.client_cpus:
+            problems.append("missing --client-cpus (or DR_CLIENT_CPUS); FL experiments need the Ray client CPU count")
+        elif args.client_cpus != 16:
+            problems.append("client-cpus must be 16 for the enforced one-GPU, four-client Flower simulation")
     if problems:
         return problems
     if not args.dry_run and not cuda_available():
         problems.append("no CUDA GPU is available to this process (a real run needs one; dry runs skip this check)")
-    if not args.skip_lock_check:
-        if not LOCK_SCRIPT.is_file():
-            problems.append(f"{LOCK_SCRIPT} does not exist, so the locked files cannot be verified; "
-                            f"create it or pass --skip-lock-check")
-        else:
-            log = _logs_dir(args) / f"verify_locks-{_utc_stamp()}.log"
-            code = run_cmd([sys.executable, str(LOCK_SCRIPT)], log, env)
-            if code != 0:
-                problems.append(f"tools/verify_locks.py exited {code}: locked files differ from their recorded hashes (log: {log})")
+    if not LOCK_SCRIPT.is_file():
+        problems.append(
+            f"{LOCK_SCRIPT} does not exist, so the locked files cannot be verified"
+        )
+    else:
+        log = _logs_dir(args) / f"verify_locks-{_utc_stamp()}.log"
+        code = run_cmd([sys.executable, str(LOCK_SCRIPT)], log, env)
+        if code != 0:
+            problems.append(
+                f"tools/verify_locks.py exited {code}: locked files differ "
+                f"from their recorded hashes (log: {log})"
+            )
     if fl:
         home = Path(env.get("FLWR_HOME") or (Path.home() / ".flwr"))
         cfg_path = home / "config.toml"
-        try:
-            ok = re.search(r"^\s*num-supernodes\s*=\s*4\b", cfg_path.read_text(encoding="utf-8"), re.MULTILINE) is not None
-        except OSError:
-            ok = False
-        if not ok:
-            print("!" * 78, file=sys.stderr)
-            print(f"WARNING: {cfg_path} does not contain 'num-supernodes = 4'. flwr's default simulation has 2 supernodes "
-                  f"and 0 GPUs, which would hang the 4-client server.", file=sys.stderr)
-            print(loader.federation_setup_text(args.client_cpus), file=sys.stderr)
-            print("!" * 78, file=sys.stderr)
+        for problem in validate_flower_config(cfg_path):
+            problems.append(f"invalid Flower configuration {cfg_path}: {problem}")
     return problems
 
 
@@ -354,18 +644,39 @@ def num_rounds_of(n: int, args: argparse.Namespace) -> Optional[int]:
 
 def attempt(n: int, k: int, args: argparse.Namespace, env: Mapping[str, str], session: Dict[str, bool]) -> bool:
     """One attempt of experiment n (the same command every time). True when it finished."""
+    global _FL_ATTEMPT, _FL_INTERRUPTED
     eid = experiment_id(n, args.dry_run)
     log = _logs_dir(args) / f"{eid}-attempt{k}-{_utc_stamp()}.log"
     if n == 1:
         return run_cmd(exp1_command(args), log, env) == 0
     cfg = load_config(n, args)
+    try:
+        active = flwr_ls()
+    except GuardError as exc:
+        raise GuardError(f"{eid}: active-run guard failed: {exc}") from exc
+    if active:
+        details = ", ".join(
+            f"{active_run_description(run)} ({run['status']})" for run in active
+        )
+        first = active[0].get("run_id")
+        stop_hint = f"\nflwr stop {first}" if first else ""
+        raise GuardError(
+            f"{eid}: refusing to launch; active Flower run(s): {details}"
+            + stop_hint
+        )
+
     toml_path = render_toml(cfg, args.checkpoint_root)
     if args.restart_superlink and not session.get("superlink_restarted"):
         session["superlink_restarted"] = True
         code = run_cmd(["pkill", "-f", "flower-superlink"], _logs_dir(args) / f"pkill-superlink-{_utc_stamp()}.log", env)
         if code not in (0, 1):  # pkill: 1 = no process matched
             print(f"WARNING: pkill -f flower-superlink exited {code}", file=sys.stderr)
-    code = run_cmd(build_flwr_command(toml_path), log, env)
+    _FL_ATTEMPT = True
+    _FL_INTERRUPTED = False
+    try:
+        code = run_cmd(build_flwr_command(toml_path), log, env)
+    finally:
+        _FL_ATTEMPT = False
     state = experiment_state(args.checkpoint_root, n, cfg["num-rounds"], dry_run=args.dry_run)
     if code == 0 and state["state"] == "done":
         return True
@@ -426,6 +737,7 @@ def run_queue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     failed = False
     interrupted = False
     session_start = time.monotonic()
+    refused = False
     for n in plan:
         if interrupted or (failed and not args.continue_on_failure):
             break
@@ -440,6 +752,18 @@ def run_queue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             print(f"--- {eid}: attempt {k} of {args.max_attempts} ---", flush=True)
             try:
                 finished = attempt(n, k, args, env, session)
+            except GuardError as exc:
+                print(str(exc), file=sys.stderr)
+                if k == 1:
+                    refused = True
+                    results[n]["result"] = "refused (active run or guard failure)"
+                    print(
+                        "Active-run guard refuses launch before the first attempt "
+                        "(exit 2).",
+                        file=sys.stderr,
+                    )
+                    break
+                finished = False
             except loader.ConfigError as exc:  # the config became unrenderable after planning
                 print(f"{eid}: attempt {k} cannot start: {exc}", file=sys.stderr)
                 finished = False
@@ -449,6 +773,28 @@ def run_queue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
             if finished:
                 break
             if k < args.max_attempts:
+                if n >= 2:
+                    if not wait_for_no_active_runs(args.active_wait_minutes):
+                        results[n]["result"] = "FAILED (active Flower run wait timed out)"
+                        failed = True
+                        print(
+                            f"{eid}: active Flower run wait timed out; not stopped",
+                            file=sys.stderr,
+                        )
+                        break
+                    try:
+                        cfg = load_config(n, args)
+                        state = experiment_state(
+                            args.checkpoint_root,
+                            n,
+                            cfg["num-rounds"],
+                            dry_run=args.dry_run,
+                        )
+                        if state["state"] == "done":
+                            finished = True
+                            break
+                    except Exception:
+                        pass
                 print(f"{eid}: retrying in {args.sleep_between:g}s (same command, resumes from latest.pt)", flush=True)
                 _sleep(args.sleep_between)
         if interrupted:
@@ -467,6 +813,9 @@ def run_queue(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     print(f"\nElapsed {int(time.monotonic() - session_start)}s. Logs: {_logs_dir(args)}")
     print("REMINDER: this runner never runs the evaluation. When all experiments are done, run "
           "`python -m evaluation.evaluate` by hand, once per experiment (the test set is touched once).")
+    if refused:
+        print("Refusing to launch: Flower active-run guard or guard failure.", file=sys.stderr)
+        return EXIT_REFUSED
     if interrupted:
         print("Interrupted: nothing was marked failed; run the same command again to resume.", file=sys.stderr)
         return EXIT_INTERRUPTED
@@ -484,11 +833,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return status_main(args)
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
+    if not args.checkpoint_root:
+        print("Refusing to start: missing --checkpoint-root (or DR_CHECKPOINT_ROOT)", file=sys.stderr)
+        return EXIT_REFUSED
+    lock_handle = None
+    try:
+        lock_handle = acquire_runner_lock(args.checkpoint_root, argv or sys.argv[1:])
+    except RunnerLockHeld as exc:
+        print(f"Refusing to start: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
     problems = preflight(args, env)
     if problems:
         print("Refusing to start:", file=sys.stderr)
         for pr in problems:
             print(f"  - {pr}", file=sys.stderr)
+        release_runner_lock(lock_handle)
         return EXIT_REFUSED
     _STOP.clear()
     previous = {}
@@ -503,6 +862,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         for name, handler in previous.items():
             signal.signal(getattr(signal, name), handler)
+        release_runner_lock(lock_handle)
 
 
 if __name__ == "__main__":

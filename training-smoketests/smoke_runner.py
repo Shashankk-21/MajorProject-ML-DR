@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import re
 import shutil
@@ -91,29 +92,52 @@ def capture(fn, *a, **k):
 
 
 class Harness:
-    """Replaces run_cmd, the sleeper, cuda detection and the lock script for one scenario."""
+    """Replaces run_cmd, guards, sleeper, cuda detection and the lock script."""
 
     def __init__(self, script):
         self.script, self.calls, self.sleeps, self.logs = script, [], [], []
         self.saved = {}
 
     def __call__(self, argv, log_path, env):
+        if len(argv) == 2 and str(argv[1]) == str(getattr(self, "default_lock", "")):
+            return 0
         self.calls.append(list(argv))
         self.logs.append(str(log_path))
         return self.script(self, list(argv))
 
     def __enter__(self):
-        for name in ("run_cmd", "_sleep", "cuda_available", "LOCK_SCRIPT"):
+        flwr_home = tmp() / "flwr"
+        (flwr_home).mkdir(exist_ok=True)
+        (flwr_home / "config.toml").write_text(
+            "[superlink.local.options]\n"
+            "num-supernodes = 4\n"
+            "[superlink.local.options.backend.client-resources]\n"
+            "num-cpus = 16\n"
+            "num-gpus = 1.0\n"
+            "[superlink.local.options.backend.init-args]\n"
+            "num-gpus = 1\n",
+            encoding="utf-8",
+        )
+        os.environ["FLWR_HOME"] = str(flwr_home)
+        for name in ("run_cmd", "_sleep", "cuda_available", "LOCK_SCRIPT",
+                     "flwr_ls", "acquire_runner_lock", "release_runner_lock"):
             self.saved[name] = getattr(rq, name)
         rq.run_cmd = self
+        self.default_lock = tmp() / "verify_default.py"
+        self.default_lock.write_text("", encoding="utf-8")
+        rq.LOCK_SCRIPT = self.default_lock
         rq._sleep = lambda s: self.sleeps.append(s)
         rq.cuda_available = lambda: True
+        rq.flwr_ls = lambda timeout=60: []
+        rq.acquire_runner_lock = lambda checkpoint_root, argv: object()
+        rq.release_runner_lock = lambda handle: None
         rq._STOP.clear()
         return self
 
     def __exit__(self, *exc):
         for name, v in self.saved.items():
             setattr(rq, name, v)
+        os.environ.pop("FLWR_HOME", None)
         rq._STOP.clear()
 
     def flwr_calls(self):
@@ -135,8 +159,8 @@ def complete(ck, argv, rounds=2, done=True):
 
 
 def argv_for(experiments, ck, cfg, *extra):
-    return ["--manifest-root", str(tmp() / "manifests"), "--checkpoint-root", str(ck), "--client-cpus", "4", "--experiments",
-            *map(str, experiments), "--config-dir", str(cfg), "--skip-lock-check", *extra]
+    return ["--manifest-root", str(tmp() / "manifests"), "--checkpoint-root", str(ck), "--client-cpus", "16", "--experiments",
+            *map(str, experiments), "--config-dir", str(cfg), *extra]
 
 
 # ------------------------------------------------------------------ pure helpers
@@ -325,32 +349,31 @@ def _():
 @test("Q10 refusals (exit 2): missing pod inputs, missing client CPUs for FL, no GPU on a real run, lock script missing or failing; dry runs skip the GPU check")
 def _():
     ck, cfg = fresh("ck"), config_dir()
-    base = ["--experiments", "2", "--config-dir", str(cfg), "--skip-lock-check"]
+    base = ["--experiments", "2", "--config-dir", str(cfg)]
     with Harness(lambda h, a: 0):
         assert capture(rq.main, ["--checkpoint-root", str(ck), "--client-cpus", "4", *base])[0] == 2
         assert capture(rq.main, ["--manifest-root", str(tmp()), "--client-cpus", "4", *base])[0] == 2
         rc, out, err = capture(rq.main, ["--manifest-root", str(tmp()), "--checkpoint-root", str(ck), *base])
         assert rc == 2 and "cpu" in (out + err).lower()
         rq.cuda_available = lambda: False
-        full = ["--manifest-root", str(tmp()), "--checkpoint-root", str(ck), "--client-cpus", "4", *base]
+        full = ["--manifest-root", str(tmp()), "--checkpoint-root", str(ck), "--client-cpus", "16", *base]
         rc, out, err = capture(rq.main, full)
         assert rc == 2 and "gpu" in (out + err).lower()
         rc, out, err = capture(rq.main, [*full, "--dry-run"])
         assert rc == 0 or rc == 3  # allowed to start; the fake never writes done.json
     with Harness(lambda h, a: 0) as h:
-        no_skip = [a for a in full if a != "--skip-lock-check"]
         rq.LOCK_SCRIPT = tmp() / "tools" / "does_not_exist.py"
-        rc, out, err = capture(rq.main, no_skip)
+        rc, out, err = capture(rq.main, full)
         assert rc == 2 and "verify_locks" in (out + err) or "lock" in (out + err).lower()
         script = tmp() / "verify_ok.py"
         script.write_text("")
         rq.LOCK_SCRIPT = script
-        rc, out, err = capture(rq.main, no_skip)
+        rc, out, err = capture(rq.main, [*full, "--dry-run"])
         assert any(c[:2] == [sys.executable, str(script)] for c in h.calls)  # the lock script was actually run
     codes = {"n": 1}
     with Harness(lambda h, a: codes["n"] if a[:2] == [sys.executable, str(script)] else 0) as h:
         rq.LOCK_SCRIPT = script
-        rc, out, err = capture(rq.main, no_skip)
+        rc, out, err = capture(rq.main, [*full, "--dry-run"])
         assert rc == 2 and not h.flwr_calls()
 
 
@@ -396,6 +419,175 @@ def _():
     t.join(25)
     assert not t.is_alive() and time.time() - started < 20 and box["code"] != 0 and rq._STOP.is_set()
     rq._STOP.clear()
+@test("R16 parse_flwr_ls accepts verified empty, running, starting, pending and finished statuses")
+def _():
+    assert rq.parse_flwr_ls('{"success": true, "runs": []}') == []
+    for status in ("running", "starting", "pending"):
+        active = rq.parse_flwr_ls(json.dumps({
+            "success": True,
+            "runs": [{"run-id": "run-123", "status": status}],
+        }))
+        assert len(active) == 1 and active[0]["run_id"] == "run-123"
+    integer_active = rq.parse_flwr_ls(json.dumps({
+        "success": True,
+        "runs": [{"run-id": 12345, "status": "running"}],
+    }))
+    assert len(integer_active) == 1 and integer_active[0]["run_id"] == "12345"
+    assert rq.parse_flwr_ls('{"success": true, "runs": [{"id": "old", "status": "FINISHED_COMPLETED"}]}') == []
+
+
+@test("R17 parse_flwr_ls rejects unknown status, malformed JSON, success false, missing runs and shape errors")
+def _():
+    raises(rq.GuardError, lambda: rq.parse_flwr_ls("{not-json"))
+    raises(rq.GuardError, lambda: rq.parse_flwr_ls('{"success": false, "runs": []}'))
+    raises(rq.GuardError, lambda: rq.parse_flwr_ls('{"success": true}'))
+    raises(rq.GuardError, lambda: rq.parse_flwr_ls('{"success": true, "runs": [{}]}'))
+    raises(rq.GuardError, lambda: rq.parse_flwr_ls('{"success": true, "runs": [{"status": "queued"}]}'))
+    raises(rq.GuardError, lambda: rq.parse_flwr_ls('{"success": true, "runs": [42]}'))
+
+
+@test("R18 active-run guard refuses the first FL attempt and names the run plus stop command")
+def _():
+    ck, cfg = fresh("ck"), config_dir()
+    with Harness(lambda h, a: 0) as h:
+        rq.flwr_ls = lambda timeout=60: [{
+            "run_id": "12345",
+            "raw": {"run-id": 12345, "status": "running"},
+            "status": "running",
+        }]
+        rc, out, err = capture(rq.main, argv_for([2], ck, cfg, "--dry-run"))
+    assert rc == 2 and h.flwr_calls() == [] and "12345" in err and "flwr stop 12345" in err
+
+
+@test("R19 retry waits for the active run to clear, recomputes state, and proceeds")
+def _():
+    ck, cfg = fresh("ck"), config_dir()
+    polls = {"n": 0}
+    def ls(timeout=60):
+        polls["n"] += 1
+        return [{"run_id": "run-old", "raw": {"id": "run-old"}, "status": "running"}] if polls["n"] == 1 else []
+
+    rq.flwr_ls = ls
+    rq.ACTIVE_WAIT_POLL_SECONDS = 0
+    assert rq.wait_for_no_active_runs(1.0) is True
+    rq.ACTIVE_WAIT_POLL_SECONDS = rq.ACTIVE_WAIT_POLL_SECONDS
+
+    states = {"n": 0}
+    def retry_script(h, argv):
+        states["n"] += 1
+        if states["n"] == 1:
+            return 1
+        complete(ck, argv)
+        return 0
+    with Harness(retry_script) as h:
+        rq.flwr_ls = lambda timeout=60: []
+        rc, out, err = capture(rq.main, argv_for([2], ck, cfg, "--dry-run", "--active-wait-minutes", "1"))
+    assert rc == 0 and len(h.flwr_calls()) == 2
+
+
+@test("R20 active-run wait timeout fails without calling stop")
+def _():
+    ck, cfg = fresh("ck"), config_dir()
+    stopped = {"n": 0}
+    with Harness(lambda h, a: 0) as h:
+        rq.flwr_ls = lambda timeout=60: [{"run_id": "run-stuck", "raw": {"id": "run-stuck"}, "status": "running"}]
+        rq.stop_flwr_run = lambda run_id, timeout=60: stopped.update(n=stopped["n"] + 1) or True
+        rq.ACTIVE_WAIT_POLL_SECONDS = 0
+        assert rq.wait_for_no_active_runs(0) is False
+    assert stopped["n"] == 0
+
+
+@test("R21 second runner lock is refused and a stale lock left by a killed process is acquirable")
+def _():
+    try:
+        import fcntl
+    except ImportError:
+        raise Skip("fcntl unavailable")
+    ck = fresh("lock")
+    first = rq.acquire_runner_lock(ck, ["--dry-run"])
+    try:
+        raises(rq.RunnerLockHeld, lambda: rq.acquire_runner_lock(ck, ["--dry-run"]))
+    finally:
+        rq.release_runner_lock(first)
+    stale = rq.acquire_runner_lock(ck, ["--dry-run"])
+    rq.release_runner_lock(stale)
+
+
+@test("R22 interrupt during FL calls stop, polls until inactive, and never forwards SIGINT")
+def _():
+    fake_child = type("Child", (), {
+        "poll": lambda self: None,
+        "send_signal": lambda self, sig: (_ for _ in ()).throw(RuntimeError("must not send")),
+        "terminate": lambda self: setattr(self, "terminated", True),
+        "kill": lambda self: None,
+    })()
+    rq._CHILD = fake_child
+    rq._FL_ATTEMPT = True
+    ls_calls = {"n": 0}
+    stopped = []
+    def ls(timeout=60):
+        ls_calls["n"] += 1
+        if ls_calls["n"] == 1:
+            return [{"run_id": "12345", "raw": {"id": 12345}, "status": "running"}]
+        return []
+    rq.flwr_ls = ls
+    rq.stop_flwr_run = lambda run_id, timeout=60: stopped.append(run_id) or True
+    rq.ACTIVE_WAIT_POLL_SECONDS = 0
+    rq._on_signal(signal.SIGINT, None)
+    rq._CHILD = None
+    rq._FL_ATTEMPT = False
+    rq._STOP.clear()
+    assert stopped == ["12345"]
+
+
+@test("R23 flwr ls failure is fail-closed and a malformed response refuses launch")
+def _():
+    ck, cfg = fresh("ck"), config_dir()
+    for failure in (
+        rq.GuardError("flwr ls exited 1"),
+        rq.GuardError("flwr ls returned malformed JSON"),
+    ):
+        with Harness(lambda h, a: 0) as h:
+            def fail(timeout=60, failure=failure):
+                raise failure
+            rq.flwr_ls = fail
+            rc, out, err = capture(rq.main, argv_for([2], ck, cfg, "--dry-run"))
+        assert rc == 2 and h.flwr_calls() == []
+
+
+@test("R24 hard Flower config gate refuses missing or incorrect required values")
+def _():
+    path = fresh("flower") / "config.toml"
+    valid = (
+        "[superlink.local.options]\nnum-supernodes = 4\n"
+        "[superlink.local.options.backend.client-resources]\nnum-cpus = 16\nnum-gpus = 1.0\n"
+        "[superlink.local.options.backend.init-args]\nnum-gpus = 1\n"
+    )
+    path.write_text(valid, encoding="utf-8")
+    assert rq.validate_flower_config(path) == []
+    for bad in (
+        valid.replace("num-supernodes = 4", "num-supernodes = 2"),
+        valid.replace("num-cpus = 16", "num-cpus = 8"),
+        valid.replace("num-gpus = 1.0", "num-gpus = 0.5"),
+        valid.replace("num-gpus = 1\n", "num-gpus = 2\n"),
+    ):
+        path.write_text(bad, encoding="utf-8")
+        assert rq.validate_flower_config(path)
+
+
+@test("R25 no --skip-lock-check bypass and queue lock is acquired before preflight")
+def _():
+    raises(SystemExit, lambda: rq.parse_args(["--skip-lock-check"]))
+    ck, cfg = fresh("ck"), config_dir()
+    seen = {"n": 0}
+    def acquire(root, argv):
+        seen["n"] += 1
+        return object()
+    with Harness(lambda h, a: 0) as h:
+        rq.acquire_runner_lock = acquire
+        rq.LOCK_SCRIPT = tmp() / "missing-lock.py"
+        rc, out, err = capture(rq.main, argv_for([2], ck, cfg, "--dry-run"))
+    assert rc == 2 and seen["n"] == 1
 
 
 # ------------------------------------------------------------------ run_experiment1

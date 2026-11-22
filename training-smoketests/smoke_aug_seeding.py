@@ -56,8 +56,8 @@ def main():
         except Exception as e:
             results.append((name, "FAIL", f"{type(e).__name__}: {str(e)[:300]}"))
 
-    manifest = Path("data") / "splits" / "IDRiD_manifest.csv"
     paths = make_clients(Path(tempfile.mkdtemp(prefix="aug_smoke_")))
+    manifest = paths["IDRiD"]
 
     def gd(workers, seed):
         return get_dataloaders("IDRiD", manifest_path=manifest, batch_size=4, num_workers=workers, seed=seed)

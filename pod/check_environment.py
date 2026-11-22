@@ -367,7 +367,6 @@ try:
 except Exception as exc:
     emit("FAIL", "verify_locks", str(exc))
 
-
 # 10. Network
 def reachable(host: str) -> bool:
     url = f"https://{host}/"
@@ -391,14 +390,38 @@ def reachable(host: str) -> bool:
             return False
 
 
-for host in ("huggingface.co", "api.wandb.ai"):
-    try:
-        if reachable(host):
-            emit("PASS", f"network {host}", "reachable")
+# Hugging Face: generic HTTPS connectivity check
+try:
+    if reachable("huggingface.co"):
+        emit("PASS", "network huggingface.co", "reachable")
+    else:
+        emit("FAIL", "network huggingface.co", "not reachable")
+except Exception as exc:
+    emit("FAIL", "network huggingface.co", str(exc))
+
+
+# Weights & Biases: verify using an authenticated API request
+try:
+    import wandb
+
+    key_path = Path("/data/.wandb_api_key")
+    api_key = key_path.read_text(encoding="utf-8").strip()
+
+    if not api_key:
+        emit("FAIL", "W&B API authentication", "API key is empty")
+    else:
+        username = wandb.Api(api_key=api_key).viewer.username
+        if username:
+            emit(
+                "PASS",
+                "W&B API authentication",
+                f"authenticated as {username}",
+            )
         else:
-            emit("FAIL", f"network {host}", "not reachable")
-    except Exception as exc:
-        emit("FAIL", f"network {host}", str(exc))
+            emit("FAIL", "W&B API authentication", "viewer username missing")
+
+except Exception as exc:
+    emit("FAIL", "W&B API authentication", str(exc))
 
 
 raise SystemExit(1 if failed else 0)

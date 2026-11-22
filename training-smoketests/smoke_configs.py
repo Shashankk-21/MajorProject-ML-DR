@@ -7,6 +7,7 @@ import re
 import shutil
 import sys
 import tempfile
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -334,15 +335,19 @@ def _():
     raises(ld.ConfigError, lambda: ld.to_centralized_kwargs({**c, "lora-rank": None}))
 
 
-def _cli(argv, patch_dir=GOOD):
+def _cli(argv, patch_dir=GOOD, clear_env=()):
     out, err = io.StringIO(), io.StringIO()
     old = ld.CONFIG_DIR
+    saved_env = {name: os.environ.pop(name, None) for name in clear_env}
     ld.CONFIG_DIR = patch_dir
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = ld.main(argv)
     finally:
         ld.CONFIG_DIR = old
+        for name, value in saved_env.items():
+            if value is not None:
+                os.environ[name] = value
     return rc, out.getvalue(), err.getvalue()
 
 
@@ -359,9 +364,12 @@ def _():
         written = tomllib.loads(f.read_text(encoding="utf-8"))
         assert written["run-hook"] == HOOK and written["experiment-id"] == "exp4-fedprox-eps50"
         assert written["manifest-root"] == "/data/manifests" and written["target-epsilon"] == 50.0
-    rc, _o, err = _cli(["4", *base])
+    rc, _o, err = _cli(["4", *base], clear_env=("DR_CLIENT_CPUS",))
     assert rc == 2 and "CPU" in err
-    rc, _o, err = _cli(["4", "--checkpoint-root", str(ck), "--client-cpus", "6"])
+    rc, _o, err = _cli(
+    ["4", "--checkpoint-root", str(ck), "--client-cpus", "6"],
+    clear_env=("DR_MANIFEST_ROOT",)
+    )
     assert rc == 2 and "manifest-root" in err
     rc, _o, err = _cli(["4", *base, "--client-cpus", "6"], patch_dir=workdir(step={**STEP, "lora-rank": "null"}))
     assert rc == 2 and "lora-rank" in err

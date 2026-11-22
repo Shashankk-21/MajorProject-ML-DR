@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import math
+import os
 import re
 import shutil
 import sys
@@ -258,7 +259,12 @@ def _():
     assert tp.parse_args(["--manifest-root", "m", "--checkpoint-root", "c", "--lora-rank", "4"]).lora_alpha == 8
     for bad in (["--steps", "0"], ["--batch-sizes", "0"], ["--lora-rank", "0"], ["--warmup-steps", "-1"]):
         raises(SystemExit, lambda bad=bad: tp.parse_args(["--manifest-root", "m", "--checkpoint-root", "c", *bad]))
-    raises(SystemExit, lambda: tp.parse_args(["--checkpoint-root", "c"]))
+    old_manifest = os.environ.pop("DR_MANIFEST_ROOT", None)
+    try:
+        raises(SystemExit, lambda: tp.parse_args(["--checkpoint-root", "c"]))
+    finally:
+        if old_manifest is not None:
+            os.environ["DR_MANIFEST_ROOT"] = old_manifest
     stamps, syncs = [], []
     got = list(tp._stamped(iter(range(100)), stamps, 5, lambda: syncs.append(1)))
     assert got == [0, 1, 2, 3, 4] and len(stamps) == 5 and len(syncs) == 5 and stamps == sorted(stamps)

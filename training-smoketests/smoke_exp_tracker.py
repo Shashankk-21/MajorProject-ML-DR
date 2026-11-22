@@ -369,6 +369,7 @@ def _():
     (TMP / "empty.txt").write_text("  \n", encoding="utf-8")
     assert et.resolve_api_key({}, TMP / "empty.txt") == (None, "none")
 
+    previous_api_key = os.environ.pop("WANDB_API_KEY", None)
     records = []
 
     class H(logging.Handler):
@@ -387,7 +388,10 @@ def _():
         assert os.environ.get("WANDB_API_KEY") == "FILEKEY-123456"
         assert "FILEKEY-123456" not in str(fw.inits) and not any("FILEKEY-123456" in r for r in records), records
     finally:
-        os.environ.pop("WANDB_API_KEY", None)
+        if previous_api_key is None:
+            os.environ.pop("WANDB_API_KEY", None)
+        else:
+            os.environ["WANDB_API_KEY"] = previous_api_key
         logging.getLogger().removeHandler(h)
         logging.getLogger().setLevel(old)
 

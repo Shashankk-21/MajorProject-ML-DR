@@ -1,7 +1,7 @@
+# pyright: reportMissingImports=false
+
 import contextlib
-import copy
 import io
-import json
 import math
 import os
 import re
@@ -19,13 +19,14 @@ for _p in (str(SZ), str(ROOT)):
 import numpy as np
 
 try:
-    import stringzilla  # noqa: F401
+    __import__("stringzilla")
 except Exception:  # DLL blocked by Windows Application Control, or missing: test-only stand-in
     from types import ModuleType
 
     _sz = ModuleType("stringzilla")
 
     def _translate(text, table, start=0, end=None, *, inplace=False):
+        del start, end
         src = np.frombuffer(text, dtype=np.uint8)
         out = np.frombuffer(table, dtype=np.uint8)[src]
         if not inplace:
@@ -285,7 +286,7 @@ def _():
         "nondp-64": {"mode": "nondp", "physical_batch": 64, "status": "OOM"},
         "dp-16": {"mode": "dp", "physical_batch": 16, "status": "ok", "seconds_per_step": 0.4, "peak_mem_gib": 4.0, "accumulation_steps": 1},
         "dp-32": {"mode": "dp", "physical_batch": 32, "status": "OOM"}}}
-    _r, out = run_capture(tp.report, store, sizes, clients, 3, 64, "Fake GPU, 16.0 GiB")
+    _, out = run_capture(tp.report, store, sizes, clients, 3, 64, "Fake GPU, 16.0 GiB")
     assert "Fake GPU" in out and Z.fmt_hms(math.ceil(70960 / 32) * 0.5) in out and "real config cannot use 48" in out
     assert "nondp: 48" in out and "dp: 16" in out and "pooled 75616" in out
     expect_dp = Z.fmt_hms(3 * Z.epoch_seconds_dp(70960, 64, 16, 0.4))
@@ -319,7 +320,7 @@ def _():
     rng = np.random.default_rng(4)
     cn = {c: _norms(rng, 1.0) for c in ("APTOS", "IDRiD", "Messidor-2", "EyePACS")}
     store = {"phases": {"epoch1": {"clients": {c: {"norms": v} for c, v in cn.items()}}}}
-    _r, out = run_capture(gp.report, store)
+    _, out = run_capture(gp.report, store)
     flat = " ".join(out.split())
     assert "IDRiD" in flat and "contributes fewer samples" in flat and "equal batches per client" not in flat
 
@@ -487,11 +488,11 @@ def _():
     assert gp.summarize_phase(skew)["recommendation"]["flag"] is True
     store = {"phases": {"init": {"clients": {c: {"norms": v} for c, v in cn.items()}},
                         "epoch1": {"clients": {c: {"norms": [x * 4 for x in v]} for c, v in cn.items()}}}}
-    _r, out = run_capture(gp.report, store)
+    _, out = run_capture(gp.report, store)
     primary = gp.summarize_phase({c: [x * 4 for x in v] for c, v in cn.items()})["recommendation"]["value_rounded"]
     assert f"max-grad-norm: {primary:g}" in out and "Phase comparison" in out and "FLAG: phases differ by more than 3x" in out
     assert "PROXY" in out and "Phase 'init'" in out and "Phase 'epoch1'" in out
-    _r, out = run_capture(gp.report, {"phases": {"init": store["phases"]["init"]}})
+    _, out = run_capture(gp.report, {"phases": {"init": store["phases"]["init"]}})
     assert "max-grad-norm:" not in out and "not measured" in out
 
 
@@ -503,7 +504,7 @@ def _():
 
     import grad_norm_probe as gp
     from configs import loader as ld
-    from models.coatnet_lora import create_coatnet_lora_model, freeze_bn_eval
+    from models.coatnet_lora import freeze_bn_eval
     from preprocessing.dataset import compute_class_weights, get_dataloaders
     from training.local_trainer import weighted_label_smoothed_ce
     patch_models()
@@ -581,8 +582,8 @@ def main():
     print()
     for n, s, msg in results:
         print(f"{s:4}  {n}" + (f"\n      {msg}" if msg else ""))
-    print(f"\n{sum(s == 'PASS' for _n, s, _m in results)}/{len(results)} passed, {sum(s == 'SKIP' for _n, s, _m in results)} skipped")
-    raise SystemExit(any(s == "FAIL" for _n, s, _m in results))
+    print(f"\n{sum(s == 'PASS' for _, s, _ in results)}/{len(results)} passed, {sum(s == 'SKIP' for _, s, _ in results)} skipped")
+    raise SystemExit(any(s == "FAIL" for _, s, _ in results))
 
 
 if __name__ == "__main__":

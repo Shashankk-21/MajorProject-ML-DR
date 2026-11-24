@@ -5,7 +5,7 @@
 # Step-zero results (decisions doc, Open items): fill after the diagnostics, then re-validate.
 lora-rank: 32            # sweep {4,8,16,32}, alpha = 2 x rank; lower rank wins near-ties (Section 1)
 lora-alpha: 64
-max-grad-norm: null        # per-sample-norm diagnostic; hypothesis 1.0 (Section 4)
+max-grad-norm: 3.49        # per-sample-norm diagnostic; hypothesis 1.0 (Section 4)
 
 # Run and data (Section 2)
 run-seed: 42

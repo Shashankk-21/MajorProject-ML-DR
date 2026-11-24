@@ -22,7 +22,7 @@
     "configs/exp6.yaml": "13A1F85F52822133F1535183FA84D449",
     "configs/exp7.yaml": "2AEEFCEFE25BD81AED175D068CA9F2C6",
     "configs/exp8.yaml": "D736A4E3D988B1265C75C1EF0E804EA7",
-    "pyproject.toml": "19FEA29A68EC9BA4797BFC4FB31FA087",
+    "pyproject.toml": "979D8510D3C7A95E7B286E21F542B0BF",
     "notebooks/stepzero/grad_norm_probe.py": "A70B83483DF254F6FD76F961EC5CFBE4",
     "notebooks/stepzero/rank_sweep.py": "F10210858D0C7E1EB1049636941B369B",
     "notebooks/stepzero/stepzero_lib.py": "D723382141EEF81E82F314024BBD631D",

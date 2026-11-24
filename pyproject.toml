@@ -15,7 +15,7 @@ packages = ["."]
 [tool.flwr.app]
 publisher = "dr-project"
 # flwr run zips the project (py/toml/md/yaml/yml/json/jsonl, 10 MB cap) and runs the INSTALLED copy.
-fab-exclude = ["training-smoketests/**", "notebooks/**"]
+fab-exclude = ["training-smoketests/**", "notebooks/**", ".gitignore"]
 
 [tool.flwr.app.components]
 serverapp = "federated.server:app"
